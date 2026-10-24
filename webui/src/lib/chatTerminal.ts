@@ -322,13 +322,15 @@ function transcriptTurns<T extends ReconcileMessage>(messages: T[]): Array<{ use
 }
 
 function joinedTurnText(rest: ReconcileMessage[]): string {
-  let text = '';
+  // Performance optimization: Collect strings into an array and join at the end
+  // to avoid intermediate string allocations during transcript reconciliation.
+  const pieces: string[] = [];
   for (const message of rest) {
     for (const part of message.parts) {
-      if ((part.kind === 'text' || part.kind === 'reasoning') && part.text) text += part.text;
+      if ((part.kind === 'text' || part.kind === 'reasoning') && part.text) pieces.push(part.text);
     }
   }
-  return text;
+  return pieces.join('');
 }
 
 /** Settled disk text must fill a tool-only canvas, and live tokens already
@@ -677,11 +679,13 @@ type ReplayPart = {
 };
 
 function joinedKindText(parts: ReplayPart[], kind: string): string {
-  let out = '';
+  // Performance optimization: Collect strings into an array and join at the end
+  // to avoid intermediate string allocations during transcript replay matching.
+  const pieces: string[] = [];
   for (const part of parts) {
-    if (part.kind === kind && part.text) out += part.text;
+    if (part.kind === kind && part.text) pieces.push(part.text);
   }
-  return out;
+  return pieces.join('');
 }
 
 /** Skip `/live` journal replay that would re-append text, reasoning, or tool
