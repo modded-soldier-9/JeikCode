@@ -264,17 +264,17 @@ function applyBatch(list: TodoItem[], actions: Record<string, unknown>[]): TodoI
   let next = kinds.has('clear') ? [] : list;
 
   if (kinds.has('delete')) {
-    const ids: number[] = [];
+    const deleteIds = new Set<number>();
     for (const action of actions) {
       const id = jsonId(action);
-      if (id !== null && id <= list.length && !ids.includes(id)) {
-        ids.push(id);
+      if (id !== null && id <= next.length) {
+        deleteIds.add(id);
       }
     }
-    ids.sort((a, b) => b - a);
-    const deleted = next.slice();
-    for (const id of ids) deleted.splice(id - 1, 1);
-    return deleted;
+    if (deleteIds.size === 0) return next;
+    // Performance optimization: Replace O(N^2) array.splice() in a loop with
+    // O(1) Set lookup and single-pass O(N) filtering to avoid linear memory shifts.
+    return next.filter((_, idx) => !deleteIds.has(idx + 1));
   }
 
   const visibleLen = next.length;
