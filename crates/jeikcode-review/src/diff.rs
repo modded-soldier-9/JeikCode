@@ -169,4 +169,100 @@ mod tests {
         // Garbage input degrades to passthrough.
         assert_eq!(annotate_diff_line_numbers("hello\nworld"), "hello\nworld");
     }
+
+    #[test]
+    fn handles_all_git_metadata_headers() {
+        let metadata = vec![
+            "diff --git a/file b/file",
+            "index 1234567..89abcdef 100644",
+            "--- a/file",
+            "+++ b/file",
+            "new file mode 100644",
+            "deleted file mode 100644",
+            "old mode 100644",
+            "new mode 100755",
+            "similarity index 100%",
+            "rename from old.txt",
+            "rename to new.txt",
+            "Binary files a/img.png and b/img.png differ",
+        ];
+
+        let diff = format!("{}\n@@ -1,1 +1,1 @@\n+line\n", metadata.join("\n"));
+        let got = annotate_diff_line_numbers(&diff);
+
+        for meta in &metadata {
+            assert!(
+                got.contains(meta),
+                "Expected metadata line verbatim: {meta}"
+            );
+        }
+        assert!(got.contains("1: +line"));
+    }
+
+    #[test]
+    fn parses_hunk_headers_without_comma_lengths() {
+        let diff = "@@ -5 +10 @@ header title\n+added\n-deleted\n context\n";
+        let got = annotate_diff_line_numbers(diff);
+        assert_eq!(
+            got,
+            "@@ -5 +10 @@ header title\n10: +added\n5: -deleted\n11:  context\n"
+        );
+    }
+
+    #[test]
+    fn handles_unparseable_and_malformed_hunk_headers() {
+        let unparseable = [
+            "@@ -abc +def @@ invalid numbers",
+            "@@ missing closing marker",
+            "@@ -10 @@ missing new line spec",
+            "@@ +10 @@ missing old line spec",
+        ];
+
+        for header in unparseable {
+            let diff = format!("{header}\n+should_not_be_annotated\n");
+            let got = annotate_diff_line_numbers(&diff);
+            assert_eq!(
+                got,
+                format!("{header}\n+should_not_be_annotated\n"),
+                "Unparseable header should keep following lines verbatim: {header}"
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_resets_in_hunk_state() {
+        let diff = "@@ -1,1 +1,1 @@\n+line1\ndiff --git a/file2 b/file2\n+line2_outside_hunk\n";
+        let got = annotate_diff_line_numbers(diff);
+        assert_eq!(
+            got,
+            "@@ -1,1 +1,1 @@\n1: +line1\ndiff --git a/file2 b/file2\n+line2_outside_hunk\n"
+        );
+    }
+
+    #[test]
+    fn handles_empty_and_newline_variations() {
+        // Empty string
+        assert_eq!(annotate_diff_line_numbers(""), "");
+
+        // Single line without newline outside hunk
+        assert_eq!(annotate_diff_line_numbers("foo"), "foo");
+
+        // Single line without newline in hunk
+        let diff_no_nl = "@@ -10,1 +10,1 @@\n+line";
+        assert_eq!(annotate_diff_line_numbers(diff_no_nl), "@@ -10,1 +10,1 @@\n10: +line");
+
+        // Multi-line without trailing newline
+        let diff_multi_no_nl = "@@ -1,1 +1,1 @@\n context\n+added";
+        assert_eq!(
+            annotate_diff_line_numbers(diff_multi_no_nl),
+            "@@ -1,1 +1,1 @@\n1:  context\n2: +added"
+        );
+
+        // Empty line inside hunk passed through without line number prefix
+        let diff_empty_line_in_hunk = "@@ -1,2 +1,2 @@\n context\n\n+added\n";
+        assert_eq!(
+            annotate_diff_line_numbers(diff_empty_line_in_hunk),
+            "@@ -1,2 +1,2 @@\n1:  context\n\n2: +added\n"
+        );
+    }
 }
