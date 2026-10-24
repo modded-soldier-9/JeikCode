@@ -610,4 +610,24 @@ test('settled disk catch-up prefers the server todo list over a short window fol
   assert.equal(settled?.length, 4);
 });
 
+test('benchmark todo batch delete performance', () => {
+  const N = 20000;
+  const initialList = [];
+  for (let i = 1; i <= N; i++) {
+    initialList.push({ content: `Item ${i}`, status: 'pending' as const });
+  }
+
+  // Delete every odd-numbered item: 1, 3, 5, ..., 19999 (10,000 items)
+  const actions: Array<{ action: string; id: number }> = [];
+  for (let i = 1; i <= N; i += 2) {
+    actions.push({ action: 'delete', id: i });
+  }
+
+  const start = performance.now();
+  const result = applyTodoAction(initialList, JSON.stringify({ actions }));
+  const elapsed = performance.now() - start;
+
+  assert.equal(result.length, N / 2);
+  console.log(`[Benchmark] Batch deleting ${actions.length} items from ${N} items took ${elapsed.toFixed(2)} ms`);
+});
 
