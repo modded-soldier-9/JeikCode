@@ -316,6 +316,130 @@ pub fn get_repo_last_polled(repo: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// 仓库故障退避与限流状态（内存缓存，防止频繁向故障/限流服务端发起无效请求）
+#[derive(Debug, Clone, Default)]
+pub struct RepoBackoffState {
+    pub consecutive_failures: u32,
+    pub backoff_until: u64,
+}
+
+static BACKOFF_CACHE: OnceLock<Mutex<HashMap<String, RepoBackoffState>>> = OnceLock::new();
+
+fn get_backoff_cache() -> &'static Mutex<HashMap<String, RepoBackoffState>> {
+    BACKOFF_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 获取指定仓库退避截止时间 (Unix 秒)
+pub fn get_repo_backoff_until(repo: &str) -> u64 {
+    let normalized = repo.trim().to_lowercase();
+    if let Ok(lock) = get_backoff_cache().lock() {
+        if let Some(state) = lock.get(&normalized) {
+            return state.backoff_until;
+        }
+    }
+    0
+}
+
+/// 记录成功轮询，清除退避与连续失败计数
+pub fn record_poll_success(repo: &str) {
+    let normalized = repo.trim().to_lowercase();
+    if let Ok(mut lock) = get_backoff_cache().lock() {
+        if let Some(state) = lock.get_mut(&normalized) {
+            state.consecutive_failures = 0;
+            state.backoff_until = 0;
+        }
+    }
+}
+
+/// 计算针对不同故障类型的退避时间与抖动 (秒)
+pub fn calculate_backoff_delay_secs(
+    consecutive_failures: u32,
+    error_msg: &str,
+    repo: &str,
+    now: u64,
+) -> u64 {
+    let err_lower = error_msg.to_lowercase();
+
+    // 1. 优先提取 Retry-After / retry-after 标头建议的秒数
+    if let Some(pos) = err_lower.find("retry-after") {
+        let slice = &err_lower[pos..];
+        let digits: String = slice
+            .chars()
+            .skip_while(|c| !c.is_ascii_digit())
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if let Ok(secs) = digits.parse::<u64>() {
+            if secs > 0 {
+                let jitter = compute_jitter(repo, now, 5);
+                return (secs + jitter).clamp(5, 3600);
+            }
+        }
+    }
+
+    // 2. HTTP 429 Too Many Requests (限流)
+    let is_rate_limit = err_lower.contains("429")
+        || err_lower.contains("too many requests")
+        || err_lower.contains("rate limit");
+    if is_rate_limit {
+        let exp_step = consecutive_failures.saturating_sub(1).min(4);
+        let base = 60u64.saturating_mul(1 << exp_step).min(900);
+        let jitter = compute_jitter(repo, now, 15);
+        return base + jitter;
+    }
+
+    // 3. 5xx 服务端故障 (500, 502, 503, 504, Server Error)
+    let is_server_error = err_lower.contains("500")
+        || err_lower.contains("502")
+        || err_lower.contains("503")
+        || err_lower.contains("504")
+        || err_lower.contains("server error")
+        || err_lower.contains("gateway");
+    if is_server_error {
+        let exp_step = consecutive_failures.saturating_sub(1).min(4);
+        let base = 30u64.saturating_mul(1 << exp_step).min(600);
+        let jitter = compute_jitter(repo, now, 10);
+        return base + jitter;
+    }
+
+    // 4. 常规网络抖动 / 超时
+    let exp_step = consecutive_failures.saturating_sub(1).min(3);
+    let base = 15u64.saturating_mul(1 << exp_step).min(180);
+    let jitter = compute_jitter(repo, now, 5);
+    base + jitter
+}
+
+/// 轻量级非加密散列抖动计算（避免引入 rand 外部依赖）
+fn compute_jitter(repo: &str, now: u64, max_jitter: u64) -> u64 {
+    if max_jitter == 0 {
+        return 0;
+    }
+    let mut hash: u64 = 0x811c9dc5;
+    for b in repo.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x01000193);
+    }
+    hash ^= now;
+    hash = hash.wrapping_mul(0x01000193);
+    hash % (max_jitter + 1)
+}
+
+/// 记录轮询失败，返回本次退避秒数
+pub fn record_poll_failure(repo: &str, error_msg: &str) -> u64 {
+    let normalized = repo.trim().to_lowercase();
+    let now = current_epoch_secs();
+    let Ok(mut lock) = get_backoff_cache().lock() else {
+        return 0;
+    };
+    let state = lock
+        .entry(normalized.clone())
+        .or_insert_with(RepoBackoffState::default);
+    state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+    let delay =
+        calculate_backoff_delay_secs(state.consecutive_failures, error_msg, &normalized, now);
+    state.backoff_until = now.saturating_add(delay);
+    delay
+}
+
 /// 单次轮询工作周期
 pub async fn poll_cycle_tick(state: &AppState) {
     if jeikcode_config::config::offline::is_offline_active() {
@@ -324,7 +448,7 @@ pub async fn poll_cycle_tick(state: &AppState) {
     let bindings = get_all_bindings();
     let now = current_epoch_secs();
 
-    for config in bindings {
+    for mut config in bindings {
         // 仅处理配置为主动轮询模式且已启用的绑定，且必须为合法的 GitHub App 模式
         if !config.enabled
             || config.sync_mode != GitSyncMode::Polling
@@ -333,17 +457,38 @@ pub async fn poll_cycle_tick(state: &AppState) {
             continue;
         }
 
-        let repo = config.repo_identifier.trim();
-        if repo.is_empty() {
+        let repo_owned = config.repo_identifier.trim().to_string();
+        if repo_owned.is_empty() {
+            continue;
+        }
+
+        // 检查是否处于限流或故障退避冷却期 (Target 3: Backoff & Jitter Defense)
+        let backoff_until = get_repo_backoff_until(&repo_owned);
+        if now < backoff_until {
+            tracing::debug!(
+                "[git_polling] Repo `{repo_owned}` is in rate-limit/backoff cooling until {backoff_until} (remaining: {}s); skipping tick",
+                backoff_until.saturating_sub(now)
+            );
             continue;
         }
 
         // 检查轮询间隔 (默认 60 秒，最小防抖 10 秒)
         let interval = (config.polling.interval_seconds as u64).max(10);
-        let last_polled = get_repo_last_polled(repo);
+        let last_polled = get_repo_last_polled(&repo_owned);
         if now.saturating_sub(last_polled) < interval {
             continue;
         }
+
+        // 自动刷新即将过期或已过期的 GitHub App 安装令牌 (Target 1: P5 Review Item)
+        if config.is_github_app_mode() {
+            if let Err(e) = config.ensure_fresh_token().await {
+                tracing::warn!(
+                    "[git_polling] Failed to refresh GitHub App installation token for `{repo_owned}`: {e}"
+                );
+            }
+        }
+
+        let repo = repo_owned.as_str();
 
         // 标记本次开始轮询时间
         mark_repo_polled(repo);
@@ -373,6 +518,9 @@ pub async fn poll_cycle_tick(state: &AppState) {
             .await
         {
             Ok(output) => {
+                // 成功通信：重置退避状态
+                record_poll_success(repo);
+
                 if output.not_modified {
                     if !is_repo_initialized(repo) {
                         tracing::warn!(
@@ -439,7 +587,10 @@ pub async fn poll_cycle_tick(state: &AppState) {
                 }
             }
             Err(e) => {
-                tracing::warn!("[git_polling] Failed to fetch open PRs for `{repo}`: {e}");
+                let backoff_secs = record_poll_failure(repo, &e);
+                tracing::warn!(
+                    "[git_polling] Failed to fetch open PRs for `{repo}`: {e} (rate-limit backoff: {backoff_secs}s)"
+                );
             }
         }
     }
@@ -849,5 +1000,178 @@ mod tests {
         update_repo_etag(repo, Some("lingering-etag-2".to_string()));
         let _ = record_poll_results_atomic(repo, &[], Some("   ".to_string()), true);
         assert_eq!(get_repo_etag(repo), None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_backoff_rate_limit_and_server_error_exponential_scaling() {
+        let repo = "test-owner/test-backoff-repo";
+        let now = 1_000_000;
+
+        // 1. Retry-After header extraction
+        let delay_retry_after = calculate_backoff_delay_secs(
+            1,
+            "GitHub fetch open PRs failed (429 Too Many Requests) (retry-after: 120s): quota exhausted",
+            repo,
+            now,
+        );
+        // Delay must be 120 + jitter (0..=5)
+        assert!(
+            (120..=125).contains(&delay_retry_after),
+            "delay was {delay_retry_after}"
+        );
+
+        // 2. HTTP 429 without Retry-After header -> exponential backoff starting at 60s
+        let delay_429_1 =
+            calculate_backoff_delay_secs(1, "API rate limit exceeded (429)", repo, now);
+        assert!((60..=75).contains(&delay_429_1), "delay was {delay_429_1}");
+
+        let delay_429_2 =
+            calculate_backoff_delay_secs(2, "API rate limit exceeded (429)", repo, now);
+        assert!(
+            (120..=135).contains(&delay_429_2),
+            "delay was {delay_429_2}"
+        );
+
+        let delay_429_3 =
+            calculate_backoff_delay_secs(3, "API rate limit exceeded (429)", repo, now);
+        assert!(
+            (240..=255).contains(&delay_429_3),
+            "delay was {delay_429_3}"
+        );
+
+        // 3. HTTP 500/502/503 server error -> exponential backoff starting at 30s
+        let delay_503_1 = calculate_backoff_delay_secs(1, "503 Service Unavailable", repo, now);
+        assert!((30..=40).contains(&delay_503_1), "delay was {delay_503_1}");
+
+        let delay_503_2 = calculate_backoff_delay_secs(2, "502 Bad Gateway", repo, now);
+        assert!((60..=70).contains(&delay_503_2), "delay was {delay_503_2}");
+
+        // 4. Record failure and verify get_repo_backoff_until, then success resets it
+        let recorded_delay = record_poll_failure(repo, "429 Too Many Requests");
+        assert!(recorded_delay >= 60);
+        let backoff_until = get_repo_backoff_until(repo);
+        assert!(backoff_until >= current_epoch_secs());
+
+        record_poll_success(repo);
+        assert_eq!(get_repo_backoff_until(repo), 0);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_ensure_fresh_token_skips_when_valid() {
+        use crate::git_adapter::{GitAdapterConfig, GitSyncMode};
+
+        let now = current_epoch_secs();
+        let mut config = GitAdapterConfig {
+            project_hash: "proj-123".to_string(),
+            enabled: true,
+            last_enabled_state: true,
+            channel: "github".to_string(),
+            sync_mode: GitSyncMode::Polling,
+            repo_identifier: "owner/repo".to_string(),
+            access_token: "ghs_valid_token".to_string(),
+            custom_api_base: String::new(),
+            webhook: Default::default(),
+            polling: Default::default(),
+            events: Default::default(),
+            trigger_keyword: "@bot".to_string(),
+            auto_review_new_pr: true,
+            update_existing_comment: true,
+            review_prompt_template: String::new(),
+            lang: None,
+            review_model: None,
+            github_app_id: Some("12345".to_string()),
+            github_app_private_key: Some("dummy-pem".to_string()),
+            github_app_private_key_path: None,
+            token_expires_at: Some(now + 2000), // > 300s remaining -> still valid!
+        };
+
+        // When token has plenty of time remaining, ensure_fresh_token returns Ok(false) without network calls
+        let refreshed = config.ensure_fresh_token().await.expect("ensure token");
+        assert!(!refreshed);
+        assert_eq!(config.access_token, "ghs_valid_token");
+    }
+
+    #[test]
+    fn test_backoff_utf8_char_boundary_safety() {
+        let repo = "owner/repo";
+        let now = 1_000_000;
+        // \u{212A} is Kelvin sign 'K' (3 bytes: \xe2\x84\xaa), which lowercases to 1-byte 'k'.
+        // If byte indexing is mismatched between lowercased string and raw string, this would panic.
+        let msg = "\u{212A} error: retry-after: 45s (please wait)";
+        let delay = calculate_backoff_delay_secs(1, msg, repo, now);
+        assert!((45..=50).contains(&delay), "delay was {delay}");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_ensure_fresh_token_triggers_refresh_when_expires_at_is_none() {
+        use crate::git_adapter::{GitAdapterConfig, GitSyncMode};
+
+        let mut config = GitAdapterConfig {
+            project_hash: "proj-expired".to_string(),
+            enabled: true,
+            last_enabled_state: true,
+            channel: "github".to_string(),
+            sync_mode: GitSyncMode::Polling,
+            repo_identifier: "owner/repo".to_string(),
+            access_token: "old_token".to_string(),
+            custom_api_base: String::new(),
+            webhook: Default::default(),
+            polling: Default::default(),
+            events: Default::default(),
+            trigger_keyword: "@bot".to_string(),
+            auto_review_new_pr: true,
+            update_existing_comment: true,
+            review_prompt_template: String::new(),
+            lang: None,
+            review_model: None,
+            github_app_id: Some("12345".to_string()),
+            github_app_private_key: Some("dummy-pem".to_string()),
+            github_app_private_key_path: None,
+            token_expires_at: None, // Missing expiration timestamp -> MUST NOT be assumed valid!
+        };
+
+        // When token_expires_at is None, ensure_fresh_token must NOT skip as valid!
+        // It must attempt to fetch an installation token (and here it fails parsing dummy PEM).
+        let res = config.ensure_fresh_token().await;
+        assert!(
+            res.is_err(),
+            "Expected token refresh attempt, got {:?}",
+            res
+        );
+    }
+
+    #[test]
+    fn test_parse_retry_after_header_delta_seconds_and_http_date() {
+        use crate::git_adapter::parse_retry_after_header;
+        use reqwest::header::{HeaderMap, HeaderValue};
+
+        // 1. Delta-seconds
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", HeaderValue::from_static("180"));
+        assert_eq!(parse_retry_after_header(&headers), Some(180));
+
+        // 2. Future RFC 7231 HTTP-date
+        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        let date_str = httpdate::fmt_http_date(future);
+        let mut headers_date = HeaderMap::new();
+        headers_date.insert(
+            "retry-after",
+            HeaderValue::from_str(&date_str).expect("valid header"),
+        );
+        let secs = parse_retry_after_header(&headers_date).expect("parsed date");
+        assert!((55..=65).contains(&secs), "secs was {secs}");
+
+        // 3. Past HTTP-date -> returns 0
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        let past_date_str = httpdate::fmt_http_date(past);
+        let mut headers_past = HeaderMap::new();
+        headers_past.insert(
+            "retry-after",
+            HeaderValue::from_str(&past_date_str).expect("valid header"),
+        );
+        assert_eq!(parse_retry_after_header(&headers_past), Some(0));
     }
 }

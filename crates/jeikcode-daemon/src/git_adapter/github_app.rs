@@ -71,7 +71,7 @@ pub async fn fetch_installation_token(
     }
 
     let jwt = create_app_jwt(app_id, private_key_pem)?;
-    let client = reqwest::Client::new();
+    let client = crate::git_adapter::shared_http_client();
 
     // 1. 查询该 App 的所有安装实体 (Installations)
     let resp = client

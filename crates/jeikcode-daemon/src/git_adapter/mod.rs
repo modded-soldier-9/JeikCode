@@ -330,6 +330,77 @@ impl GitAdapterConfig {
             self.last_enabled_state = false;
         }
     }
+
+    /// 确保当前配置的 GitHub App 安装访问令牌有效（若距过期不足 5 分钟或已过期，则自动换发新令牌并持久化落盘）
+    pub async fn ensure_fresh_token(&mut self) -> Result<bool, String> {
+        if !self.is_github_app_mode() {
+            return Ok(false);
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let token_still_valid = self
+            .token_expires_at
+            .is_some_and(|exp| exp > now + 300 && !self.access_token.trim().is_empty());
+
+        if token_still_valid {
+            return Ok(false);
+        }
+
+        let app_id_str = self.github_app_id.as_deref().unwrap_or_default();
+        let app_id = app_id_str
+            .trim()
+            .parse::<u64>()
+            .map_err(|e| format!("Invalid GitHub App ID `{app_id_str}`: {e}"))?;
+
+        let pem_res = if let Some(content) = self
+            .github_app_private_key
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+        {
+            Some(content.to_string())
+        } else if let Some(path) = self
+            .github_app_private_key_path
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+        {
+            match std::fs::read_to_string(path.trim()) {
+                Ok(content) => Some(content),
+                Err(err) => {
+                    return Err(format!(
+                        "Failed to read GitHub App private key from `{path}`: {err}"
+                    ))
+                }
+            }
+        } else {
+            None
+        };
+
+        let pem =
+            pem_res.ok_or_else(|| "Missing GitHub App private key PEM or file".to_string())?;
+
+        let (fresh_token, _) =
+            github_app::fetch_installation_token(app_id, &pem, &self.repo_identifier).await?;
+
+        self.access_token = fresh_token.clone();
+        self.token_expires_at = Some(now + 3300);
+
+        let existing_opt = if !self.project_hash.is_empty() {
+            get_binding_by_project(&self.project_hash)
+        } else {
+            find_binding_by_repo(&self.repo_identifier)
+        };
+        if let Some(mut existing) = existing_opt {
+            existing.access_token = fresh_token;
+            existing.token_expires_at = Some(now + 3300);
+            save_binding(existing);
+        }
+
+        Ok(true)
+    }
 }
 
 fn default_keyword() -> String {
@@ -454,6 +525,36 @@ pub fn get_platform_adapter(channel: &str) -> Arc<dyn GitPlatformAdapter> {
         "gitee" => Arc::new(gitee::GiteeAdapter::new()),
         _ => Arc::new(github::GitHubAdapter::new()),
     }
+}
+
+static SHARED_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+/// 获取 Git 适配器共享的 HTTP 连接池客户端（15s 超时，TLS 连接复用）
+pub fn shared_http_client() -> &'static reqwest::Client {
+    SHARED_HTTP_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .pool_max_idle_per_host(10)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
+}
+
+/// 解析 HTTP 响应头中的 Retry-After（支持 delta-seconds 纯整数秒与 RFC 7231 HTTP-date 绝对时间戳）
+pub fn parse_retry_after_header(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let val = headers.get("retry-after")?.to_str().ok()?.trim();
+    if let Ok(secs) = val.parse::<u64>() {
+        return Some(secs);
+    }
+    if let Ok(when) = httpdate::parse_http_date(val) {
+        return Some(
+            when.duration_since(std::time::SystemTime::now())
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        );
+    }
+    None
 }
 
 /// 标准 RFC 2104 HMAC-SHA256 计算实现（纯 sha2 依赖，零外部新增 crate）
