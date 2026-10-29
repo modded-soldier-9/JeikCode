@@ -1,0 +1,3 @@
+## 2024-10-29 - Preact memoization for Markdown
+**Learning:** Preact applications can suffer from unnecessary re-renders in chat applications when streaming new tokens. Wrapping heavy components like `Markdown` in `memo` (from `preact/compat`) prevents unchanged historical messages from re-rendering, saving CPU cycles on DOMPurify and markdown parsing.
+**Action:** Always check if list item components (like chat messages) that receive primitive props are memoized, especially if the parent re-renders frequently (e.g., during streaming). Import React features from `preact/compat` when working in Preact codebases.
