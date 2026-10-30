@@ -1,6 +1,7 @@
 import DOMPurify from 'dompurify';
 import { useMemo, useRef, useEffect } from 'preact/hooks';
 import { render } from 'preact';
+import { memo } from 'preact/compat';
 import { markdownToHtml } from '../lib/markdownRender';
 import { MermaidDiagram } from './MermaidDiagram';
 import { useSettings } from '../settings';
@@ -50,7 +51,8 @@ function highlightHtml(html: string, search: string): string {
   return doc.body.innerHTML;
 }
 
-export function Markdown({ content, search }: { content: string; search?: string }) {
+export const Markdown = memo(function Markdown({ content, search }: { content: string; search?: string }) {
+  // ⚡ Bolt: wrap Markdown with React.memo to prevent re-renders of history bubbles.
   const { theme } = useSettings();
   const isDark = (theme === 'dark') ||
     (theme === 'system' && typeof window !== 'undefined' && window.matchMedia('(prefers-color-scheme: dark)').matches) ||
@@ -166,4 +168,4 @@ export function Markdown({ content, search }: { content: string; search?: string
       dangerouslySetInnerHTML={{ __html: html }}
     />
   );
-}
+});
