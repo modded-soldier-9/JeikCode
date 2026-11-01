@@ -438,11 +438,11 @@ function BatchCard({ req, onDone, submitAnswer, dock }: UserInputCardProps) {
             {t('userInput.skip')}
           </button>
           {step > 0 && (
-            <button class="btn" disabled={loading} onClick={back}>
+            <button class="btn" disabled={loading} onClick={back} aria-label={t('notify.action.prev')}>
               ←
             </button>
           )}
-          <button class="btn btn-primary" disabled={nextDisabled} onClick={next}>
+          <button class="btn btn-primary" disabled={nextDisabled} onClick={next} aria-label={isLast ? t('userInput.submit') : t('notify.action.next')}>
             {isLast ? t('userInput.submit') : '→'}
           </button>
         </>
