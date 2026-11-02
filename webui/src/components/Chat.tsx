@@ -51,7 +51,7 @@ import {
   recordUserManualStop,
   recordUserSteer,
 } from '../lib/sessionNotify';
-import { createPortal } from 'preact/compat';
+import { createPortal, memo } from 'preact/compat';
 import { Markdown } from './Markdown';
 import { ModelSelector } from './ModelSelector';
 import { ModeSelector } from './ModeSelector';
@@ -7127,7 +7127,6 @@ export function Chat({
 
           return visibleMessages.map(({ msg, origIdx }, idx) => {
             const isLast = idx === lastVisibleIdx;
-            const setMatchRef = (el: HTMLElement | null) => { matchRefs.current[origIdx] = el; };
             const timeLabel = formatMsgTime(msg.ts, t);
             const timeFull = formatMsgTimeFull(msg.ts);
             const isActiveSearchMatch = searchOpen && searchTrim ? (origIdx === matchPositions[matchIdx]) : false;
@@ -7143,7 +7142,8 @@ export function Chat({
                   msg={msg}
                   anchorId={turnItem?.id}
                   turnNavIdx={turnIndex}
-                  searchRef={setMatchRef}
+                  matchRefs={matchRefs}
+                  origIdx={origIdx}
                   timeLabel={timeLabel}
                   timeFull={timeFull}
                   search={search}
@@ -7158,7 +7158,7 @@ export function Chat({
               const fullText = msg.parts.map((p) => (p.kind === 'notice' ? p.text : '')).join('');
               const sysCls = 'msg-notice command-output' + (isActiveSearchMatch ? ' is-active-search-match' : '');
               return (
-                <div class={sysCls} key={origIdx} ref={setMatchRef}>
+                <div class={sysCls} key={origIdx} ref={(el) => { if (matchRefs) matchRefs.current[origIdx] = el; }}>
                   {highlightText(fullText, search)}
                 </div>
               );
@@ -7188,12 +7188,13 @@ export function Chat({
                 key={origIdx}
                 msg={msg}
                 isLast={isLast}
-                busy={busy}
+                streaming={isLast && busy}
                 lastIdx={lastIdx}
                 isLastInTurn={isLastInTurn}
                 turnLastText={turnLastTexts.get(origIdx) ?? ''}
                 turnAllText={turnAllTexts.get(origIdx) ?? ''}
-                searchRef={setMatchRef}
+                matchRefs={matchRefs}
+                origIdx={origIdx}
                 timeLabel={isLastInTurn ? timeLabel : undefined}
                 timeFull={isLastInTurn ? timeFull : undefined}
                 liveElapsedMs={liveFromUser}
@@ -7610,15 +7611,16 @@ export function Chat({
  *  text run becomes Markdown; runs of consecutive tool calls share one
  *  `.tool-list` container. This is what preserves the text→tool→text→tool
  *  interleaving (matching the TUI) instead of grouping all tools at the head. */
-function AssistantMessageView({
+const AssistantMessageView = memo(function AssistantMessageView({
   msg,
   isLast,
-  busy,
+  streaming,
   lastIdx: _lastIdx,
   isLastInTurn,
   turnLastText,
   turnAllText,
-  searchRef,
+  matchRefs,
+  origIdx,
   timeLabel,
   timeFull,
   liveElapsedMs,
@@ -7628,12 +7630,13 @@ function AssistantMessageView({
 }: {
   msg: Message;
   isLast: boolean;
-  busy: boolean;
+  streaming: boolean;
   lastIdx: number;
   isLastInTurn: boolean;
   turnLastText: string;
   turnAllText: string;
-  searchRef?: (el: HTMLElement | null) => void;
+  matchRefs?: { current: Record<number, HTMLElement | null> };
+  origIdx: number;
   timeLabel?: string;
   timeFull?: string;
   liveElapsedMs?: number;
@@ -7652,7 +7655,6 @@ function AssistantMessageView({
       trimmed.startsWith('[连接错误:') ||
       trimmed.startsWith('[Error:') ||
       trimmed.startsWith('[Connection error:'));
-  const streaming = isLast && busy;
   // 终条且简短（无工具、单行）时，去掉多余 of "时间线末端"橙点，只留一个起始点。
   const terse =
     isLast && !streaming && !messageHasTools(msg) && !text.includes('\n');
@@ -7743,7 +7745,7 @@ function AssistantMessageView({
   );
 
   return (
-    <div class={cls} ref={searchRef}>
+    <div class={cls} ref={(el) => { if (matchRefs) matchRefs.current[origIdx] = el; }}>
       {/* Error turns are pure injected text — render flat. */}
       {isError ? (
         <div class="error-message-content">
@@ -7796,7 +7798,7 @@ function AssistantMessageView({
       </div>
     </div>
   );
-}
+});
 
 function renderAssistantParts(parts: MsgPart[], search: string): VNode[] {
   const out: VNode[] = [];
@@ -7984,11 +7986,12 @@ function highlightText(text: string, search: string) {
   return parts;
 }
 
-function UserMessageView({
+const UserMessageView = memo(function UserMessageView({
   msg,
   anchorId,
   turnNavIdx,
-  searchRef,
+  matchRefs,
+  origIdx,
   timeLabel,
   timeFull,
   search,
@@ -7997,7 +8000,8 @@ function UserMessageView({
   msg: Message;
   anchorId?: string;
   turnNavIdx?: number;
-  searchRef?: (el: HTMLElement | null) => void;
+  matchRefs?: { current: Record<number, HTMLElement | null> };
+  origIdx: number;
   timeLabel?: string;
   timeFull?: string;
   search: string;
@@ -8053,7 +8057,7 @@ function UserMessageView({
 
   if (skillTitle && !expanded) {
     return (
-      <div class={wrapperClass} id={anchorId} data-turn-nav={anchorId || undefined} data-turn-nav-idx={turnNavIdx} ref={searchRef}>
+      <div class={wrapperClass} id={anchorId} data-turn-nav={anchorId || undefined} data-turn-nav-idx={turnNavIdx} ref={(el) => { if (matchRefs) matchRefs.current[origIdx] = el; }}>
         {images}
         <button
           class="skill-badge"
@@ -8070,7 +8074,7 @@ function UserMessageView({
   }
 
   return (
-    <div class={wrapperClass} id={anchorId} data-turn-nav={anchorId || undefined} data-turn-nav-idx={turnNavIdx} ref={searchRef}>
+    <div class={wrapperClass} id={anchorId} data-turn-nav={anchorId || undefined} data-turn-nav-idx={turnNavIdx} ref={(el) => { if (matchRefs) matchRefs.current[origIdx] = el; }}>
       <div class={'user-message-bubble' + (skillTitle ? ' is-markdown' : '')}>
         {images}
         {skillTitle && (
@@ -8088,7 +8092,7 @@ function UserMessageView({
       </div>
     </div>
   );
-}
+});
 
 // Status glyph: a check when done, a cross on error, otherwise a spinner that
 // animates while the call is pending / awaiting approval.
