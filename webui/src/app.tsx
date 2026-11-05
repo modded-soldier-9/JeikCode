@@ -881,6 +881,7 @@ export function App() {
                               handleCloseDiffTab(tab.id);
                             }}
                             title="Close tab"
+                            aria-label="Close tab"
                           >
                             ×
                           </button>
@@ -951,6 +952,7 @@ export function App() {
                             handleCloseDiffTab(tab.id);
                           }}
                           title="Close tab"
+                          aria-label="Close tab"
                         >
                           ×
                         </button>
@@ -1026,6 +1028,7 @@ export function App() {
                                     handleCloseDiffTab(tab.id);
                                   }}
                                   title="Close tab"
+                                  aria-label="Close tab"
                                 >
                                   ×
                                 </button>
