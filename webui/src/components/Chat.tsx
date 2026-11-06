@@ -51,7 +51,7 @@ import {
   recordUserManualStop,
   recordUserSteer,
 } from '../lib/sessionNotify';
-import { createPortal } from 'preact/compat';
+import { createPortal, memo } from 'preact/compat';
 import { Markdown } from './Markdown';
 import { ModelSelector } from './ModelSelector';
 import { ModeSelector } from './ModeSelector';
@@ -7610,7 +7610,7 @@ export function Chat({
  *  text run becomes Markdown; runs of consecutive tool calls share one
  *  `.tool-list` container. This is what preserves the text→tool→text→tool
  *  interleaving (matching the TUI) instead of grouping all tools at the head. */
-function AssistantMessageView({
+const AssistantMessageView = memo(function AssistantMessageView({
   msg,
   isLast,
   busy,
@@ -7796,7 +7796,26 @@ function AssistantMessageView({
       </div>
     </div>
   );
-}
+}, (prev, next) => {
+  // ⚡ Bolt: Custom equality function to prevent re-renders when typing.
+  // It intentionally ignores inline function props like `searchRef` which change
+  // reference on every keystroke but don't affect the view output.
+  return (
+    prev.msg === next.msg &&
+    prev.isLast === next.isLast &&
+    prev.busy === next.busy &&
+    prev.lastIdx === next.lastIdx &&
+    prev.isLastInTurn === next.isLastInTurn &&
+    prev.turnLastText === next.turnLastText &&
+    prev.turnAllText === next.turnAllText &&
+    prev.timeLabel === next.timeLabel &&
+    prev.timeFull === next.timeFull &&
+    prev.liveElapsedMs === next.liveElapsedMs &&
+    prev.turnTotalMs === next.turnTotalMs &&
+    prev.search === next.search &&
+    prev.isActiveSearchMatch === next.isActiveSearchMatch
+  );
+});
 
 function renderAssistantParts(parts: MsgPart[], search: string): VNode[] {
   const out: VNode[] = [];
@@ -7984,7 +8003,7 @@ function highlightText(text: string, search: string) {
   return parts;
 }
 
-function UserMessageView({
+const UserMessageView = memo(function UserMessageView({
   msg,
   anchorId,
   turnNavIdx,
@@ -8088,7 +8107,20 @@ function UserMessageView({
       </div>
     </div>
   );
-}
+}, (prev, next) => {
+  // ⚡ Bolt: Custom equality function to prevent re-renders when typing.
+  // It intentionally ignores inline function props like `searchRef` which change
+  // reference on every keystroke but don't affect the view output.
+  return (
+    prev.msg === next.msg &&
+    prev.anchorId === next.anchorId &&
+    prev.turnNavIdx === next.turnNavIdx &&
+    prev.timeLabel === next.timeLabel &&
+    prev.timeFull === next.timeFull &&
+    prev.search === next.search &&
+    prev.isActiveSearchMatch === next.isActiveSearchMatch
+  );
+});
 
 // Status glyph: a check when done, a cross on error, otherwise a spinner that
 // animates while the call is pending / awaiting approval.
