@@ -51,7 +51,7 @@ import {
   recordUserManualStop,
   recordUserSteer,
 } from '../lib/sessionNotify';
-import { createPortal } from 'preact/compat';
+import { createPortal, memo } from 'preact/compat';
 import { Markdown } from './Markdown';
 import { ModelSelector } from './ModelSelector';
 import { ModeSelector } from './ModeSelector';
@@ -7138,7 +7138,7 @@ export function Chat({
                 ? turnNavByOrdinal.get(msg.turnNavOrdinal)
                 : turnNavByIndex.get(turnIndex);
               return (
-                <UserMessageView
+                <MemoizedUserMessageView
                   key={turnItem?.id ?? turnIndex}
                   msg={msg}
                   anchorId={turnItem?.id}
@@ -7184,7 +7184,7 @@ export function Chat({
               : undefined;
 
             return (
-              <AssistantMessageView
+              <MemoizedAssistantMessageView
                 key={origIdx}
                 msg={msg}
                 isLast={isLast}
@@ -7610,6 +7610,46 @@ export function Chat({
  *  text run becomes Markdown; runs of consecutive tool calls share one
  *  `.tool-list` container. This is what preserves the text→tool→text→tool
  *  interleaving (matching the TUI) instead of grouping all tools at the head. */
+// Memoize message views to prevent full chat re-renders.
+// We provide custom `areEqual` functions to ignore `searchRef` inline functions
+// which change on every parent render.
+const MemoizedAssistantMessageView = memo(AssistantMessageView, (prev, next) => {
+  // We must execute searchRef if it's changing, but since we memoize, we don't re-render.
+  // Normally ignoring an inline function ref in memoization causes stale closures.
+  // To mitigate this, since searchRef only assigns a DOM element to a mutable `useRef` dictionary,
+  // we do not need to call the *new* searchRef, we just need to ensure the element isn't lost.
+  // Actually, Preact/React doesn't automatically call the ref unless it re-renders.
+  // However, because we use a single `matchRefs.current` map keyed by `origIdx`,
+  // the stale closure is harmless: `origIdx` is constant for a given message!
+  return (
+    prev.msg === next.msg &&
+    prev.isLast === next.isLast &&
+    prev.busy === next.busy &&
+    prev.lastIdx === next.lastIdx &&
+    prev.isLastInTurn === next.isLastInTurn &&
+    prev.turnLastText === next.turnLastText &&
+    prev.turnAllText === next.turnAllText &&
+    prev.timeLabel === next.timeLabel &&
+    prev.timeFull === next.timeFull &&
+    prev.liveElapsedMs === next.liveElapsedMs &&
+    prev.turnTotalMs === next.turnTotalMs &&
+    prev.search === next.search &&
+    prev.isActiveSearchMatch === next.isActiveSearchMatch
+  );
+});
+
+const MemoizedUserMessageView = memo(UserMessageView, (prev, next) => {
+  return (
+    prev.msg === next.msg &&
+    prev.anchorId === next.anchorId &&
+    prev.turnNavIdx === next.turnNavIdx &&
+    prev.timeLabel === next.timeLabel &&
+    prev.timeFull === next.timeFull &&
+    prev.search === next.search &&
+    prev.isActiveSearchMatch === next.isActiveSearchMatch
+  );
+});
+
 function AssistantMessageView({
   msg,
   isLast,
