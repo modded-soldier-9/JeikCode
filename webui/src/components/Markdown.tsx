@@ -59,16 +59,15 @@ export function Markdown({ content, search }: { content: string; search?: string
   const rootRef = useRef<HTMLDivElement>(null);
 
   const html = useMemo(() => {
-    const raw = markdownToHtml(content ?? '');
+    let raw = markdownToHtml(content ?? '');
+    if (search && search.trim()) {
+      raw = highlightHtml(raw, search);
+    }
     // SECURITY: model output is untrusted — sanitize before injecting as HTML.
-    const sanitized = DOMPurify.sanitize(raw, {
+    return DOMPurify.sanitize(raw, {
       ADD_TAGS: ['math', 'annotation', 'semantics', 'mrow', 'mi', 'mo', 'mn', 'ms', 'mtext', 'mspace', 'mfrac', 'msqrt', 'mroot', 'msub', 'msup', 'msubsup', 'munder', 'mover', 'munderover', 'mtable', 'mtr', 'mtd', 'mstyle'],
       ADD_ATTR: ['id', 'data-alt-id', 'data-copy', 'data-mermaid-code', 'class', 'checked', 'disabled', 'type', 'align', 'start', 'colspan', 'rowspan', 'style', 'aria-hidden', 'encoding', 'target', 'rel'],
     });
-    if (search && search.trim()) {
-      return highlightHtml(sanitized, search);
-    }
-    return sanitized;
   }, [content, search]);
 
   // 水合挂载 MermaidDiagram 交互矢量图组件
